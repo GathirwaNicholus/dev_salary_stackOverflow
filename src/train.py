@@ -1,20 +1,20 @@
 """
 End-to-end training script for the developer salary prediction model.
 
-v3 improvements (from v2 baseline R²=0.48):
-───────────────────────────────────────────
-1. TARGET ENCODING for Country, DevType, Industry
-   → replaces 24+ sparse OHE columns with 3 dense, signal-rich features
-2. ORDINAL ENCODING for EdLevel & RemoteWork (preserves natural ordering)
-3. EMPLOYMENT FILTER — drop students/part-timers/NaN (noisy for salary)
-4. INTERACTION FEATURES — YearsCode², WorkExp², experience ratio, tech breadth
-5. EARLY STOPPING — fit XGBoost on a train/val split to find optimal tree count
-   then retrain full pipeline with that count
-6. 5-FOLD CROSS-VALIDATION — proves the R² is reproducible
+v4 improvements (from v3 — CV R²=0.56):
+────────────────────────────────────────
+1. STACKING ENSEMBLE: XGBoost + GradientBoosting → Ridge meta-learner
+   → two diverse tree models learn slightly different patterns; the
+     Ridge combiner finds optimal weights
+2. NEW FEATURES: has_high_pay_lang (Go/Rust/Scala/...) + DevTypeCount
+3. RELAXED REGULARISATION: deeper trees + lower min_child_weight to let
+   the model capture more complex salary patterns
+4. EARLY STOPPING still used to find optimal tree count for XGBoost;
+   GradientBoosting uses a fixed sensible count
 
 OUTPUTS
 ───────
-1. models/salary_pipeline.pkl  – trained pipeline
+1. models/salary_pipeline.pkl
 2. data/cleaned/processed_data.csv
 3. data/predictions_plot.png
 4. experiments/results.json
@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,9 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import GradientBoostingRegressor, StackingRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, TargetEncoder
@@ -59,22 +62,32 @@ RESULTS_PATH = EXPERIMENTS_DIR / "results.json"
 # ── config ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
-EARLY_STOP_VAL_SIZE = 0.15  # 15% of training set used for early stopping
+EARLY_STOP_VAL_SIZE = 0.15
 
+# v4: slightly relaxed regularisation to let the model capture more signal
 XGBOOST_PARAMS: dict = {
-    "n_estimators": 2000,       # set high – early stopping picks the best
-    "max_depth": 6,
-    "learning_rate": 0.03,
+    "n_estimators": 3000,       # high — early stopping picks the best
+    "max_depth": 7,             # was 6 — captures deeper feature interactions
+    "learning_rate": 0.02,      # was 0.03 — lower LR with more trees
     "subsample": 0.75,
-    "colsample_bytree": 0.65,
-    "min_child_weight": 8,
-    "gamma": 0.15,
-    "reg_alpha": 0.08,
-    "reg_lambda": 1.5,
+    "colsample_bytree": 0.6,    # was 0.65
+    "min_child_weight": 5,      # was 8 — less restrictive
+    "gamma": 0.1,               # was 0.15
+    "reg_alpha": 0.05,          # was 0.08
+    "reg_lambda": 1.0,          # was 1.5
     "max_delta_step": 1,
     "tree_method": "hist",
     "random_state": RANDOM_STATE,
     "verbosity": 0,
+}
+
+GBR_PARAMS: dict = {
+    "n_estimators": 300,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "min_samples_leaf": 10,
+    "random_state": RANDOM_STATE,
 }
 
 
@@ -85,18 +98,14 @@ def build_preprocessor(
     num_cols: list[str],
 ) -> ColumnTransformer:
     """
-    Build a ColumnTransformer with two parallel branches:
-
-    1. Numeric → median-impute → standard-scale
-    2. Categorical → sklearn TargetEncoder (learns mean-target per category,
-       uses internal cross-fitting to prevent data leakage)
+    Numeric → median-impute → standard-scale
+    Categorical → TargetEncoder (mean-salary per category, CV-protected)
     """
     numeric_pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
     ])
 
-    # TargetEncoder handles NaN internally (maps to global target mean)
     target_enc = TargetEncoder(
         smooth="auto",
         target_type="continuous",
@@ -115,16 +124,35 @@ def build_preprocessor(
 def build_pipeline(
     target_enc_cols: list[str],
     num_cols: list[str],
-    n_estimators: int | None = None,
+    xgb_n_estimators: int | None = None,
+    use_stacking: bool = True,
 ) -> Pipeline:
-    """Combine preprocessor + XGBoost into one sklearn Pipeline."""
+    """
+    Combine preprocessor + model into one sklearn Pipeline.
+
+    If use_stacking=True, the model is a StackingRegressor that blends
+    XGBoost + GradientBoosting through a Ridge meta-learner.
+    """
     preprocessor = build_preprocessor(target_enc_cols, num_cols)
 
-    params = XGBOOST_PARAMS.copy()
-    if n_estimators is not None:
-        params["n_estimators"] = n_estimators
+    xgb_params = XGBOOST_PARAMS.copy()
+    if xgb_n_estimators is not None:
+        xgb_params["n_estimators"] = xgb_n_estimators
 
-    model = XGBRegressor(**params)
+    xgb = XGBRegressor(**xgb_params)
+
+    if use_stacking:
+        gbr_params = GBR_PARAMS.copy()
+        gbr = GradientBoostingRegressor(**gbr_params)
+
+        model = StackingRegressor(
+            estimators=[("xgb", xgb), ("gbr", gbr)],
+            final_estimator=Ridge(alpha=1.0),
+            cv=3,
+        )
+    else:
+        model = xgb
+
     return Pipeline([
         ("preprocessor", preprocessor),
         ("model", model),
@@ -139,8 +167,7 @@ def find_best_n_estimators(
 ) -> int:
     """
     Use a held-out validation set + early stopping to find the
-    optimal number of boosting rounds.  This prevents overfitting
-    and closes the train/test R² gap.
+    optimal number of XGBoost boosting rounds.
     """
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train,
@@ -148,7 +175,6 @@ def find_best_n_estimators(
         random_state=RANDOM_STATE,
     )
 
-    # Fit preprocessor on the training subset
     preprocessor = build_preprocessor(target_enc_cols, num_cols)
     X_tr_processed = preprocessor.fit_transform(X_tr, y_tr)
     X_val_processed = preprocessor.transform(X_val)
@@ -163,7 +189,7 @@ def find_best_n_estimators(
         verbose=False,
     )
 
-    best = model.best_iteration + 1   # 0-indexed → count
+    best = model.best_iteration + 1
     print(f"  Early stopping: best iteration = {best} / {params['n_estimators']}")
     return best
 
@@ -174,22 +200,26 @@ def log_experiment(
     params: dict,
     train_metrics: dict,
     test_metrics: dict,
-    cv_r2: float | None = None,
+    cv_r2_mean: float | None = None,
+    cv_r2_std: float | None = None,
     n_features: int | None = None,
+    use_stacking: bool = False,
 ) -> None:
     """Append run config + results to experiments/results.json."""
     EXPERIMENTS_DIR.mkdir(exist_ok=True)
 
     record = {
         "timestamp": datetime.now().isoformat(),
-        "version": "v3",
+        "version": "v4",
+        "use_stacking": use_stacking,
         "n_features": n_features,
         "xgboost_params": params,
         "train": train_metrics,
         "test": test_metrics,
     }
-    if cv_r2 is not None:
-        record["cv_r2_mean"] = cv_r2
+    if cv_r2_mean is not None:
+        record["cv_r2_mean"] = cv_r2_mean
+        record["cv_r2_std"] = cv_r2_std
 
     history: list = []
     if RESULTS_PATH.exists():
@@ -207,9 +237,12 @@ def log_experiment(
 # ── main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """End-to-end: load → clean → early-stop → train → cross-validate → save."""
+    """End-to-end: load → clean → early-stop → stack → cross-validate → save."""
+    t0 = time.time()
+
     print("=" * 60)
-    print("  Developer Salary Prediction — Training  (v3)")
+    print("  Developer Salary Prediction — Training  (v4)")
+    print("  Model: XGBoost + GradientBoosting  →  Ridge (stacking)")
     print("=" * 60)
 
     # ── 1. Load and clean data ────────────────────────────────────────────
@@ -236,13 +269,20 @@ def main() -> None:
     print(f"Training samples : {len(X_train):,}")
     print(f"Testing samples  : {len(X_test):,}\n")
 
-    # ── 4. Find optimal n_estimators via early stopping ───────────────────
-    print("Step 1/3  Finding optimal tree count (early stopping) ...")
+    # ── 4. Find optimal XGBoost tree count ────────────────────────────────
+    print("Step 1/3  Finding optimal XGBoost tree count (early stopping) ...")
     best_n = find_best_n_estimators(X_train, y_train, target_enc_cols, num_cols)
 
-    # ── 5. Train final pipeline on full training data ─────────────────────
-    print(f"\nStep 2/3  Training final pipeline with {best_n} trees ...")
-    pipeline = build_pipeline(target_enc_cols, num_cols, n_estimators=best_n)
+    # ── 5. Train stacking pipeline on full training data ──────────────────
+    print(f"\nStep 2/3  Training stacking ensemble "
+          f"(XGBoost[{best_n}] + GBR[{GBR_PARAMS['n_estimators']}] → Ridge) ...")
+    print("         This may take a few minutes ...")
+
+    pipeline = build_pipeline(
+        target_enc_cols, num_cols,
+        xgb_n_estimators=best_n,
+        use_stacking=True,
+    )
     pipeline.fit(X_train, y_train)
     print("Training complete.\n")
 
@@ -250,27 +290,35 @@ def main() -> None:
     y_pred_log_train = pipeline.predict(X_train)
     y_pred_log_test = pipeline.predict(X_test)
 
-    # Log scale (what the model optimises)
-    evaluate_model(y_train, y_pred_log_train, title="Training set (log scale)")
-    evaluate_model(y_test, y_pred_log_test, title="Test set (log scale)")
+    # Log scale (model's native metric — this is what CV reports)
+    train_metrics_log = evaluate_model(
+        y_train, y_pred_log_train, title="Training set (log scale)"
+    )
+    test_metrics_log = evaluate_model(
+        y_test, y_pred_log_test, title="Test set (log scale) ← model's native metric"
+    )
 
-    # USD scale (human-readable)
+    # USD scale (human-interpretable)
     y_train_usd = np.expm1(y_train)
     y_test_usd = np.expm1(y_test)
     y_pred_train_usd = np.expm1(y_pred_log_train)
     y_pred_test_usd = np.expm1(y_pred_log_test)
 
-    train_metrics = evaluate_model(
+    train_metrics_usd = evaluate_model(
         y_train_usd, y_pred_train_usd, title="Training set (USD)"
     )
-    test_metrics = evaluate_model(
-        y_test_usd, y_pred_test_usd, title="Test set (USD) ← main metric"
+    test_metrics_usd = evaluate_model(
+        y_test_usd, y_pred_test_usd, title="Test set (USD)"
     )
-    print_observations(test_metrics)
+    print_observations(test_metrics_usd)
 
-    # ── 7. 5-fold cross-validation (proves reproducibility) ───────────────
-    print("\nStep 3/3  5-fold cross-validation (this may take a minute) ...")
-    cv_pipeline = build_pipeline(target_enc_cols, num_cols, n_estimators=best_n)
+    # ── 7. 5-fold cross-validation (log scale — reproducibility proof) ────
+    print("\nStep 3/3  5-fold cross-validation (log scale, may take 5-10 min) ...")
+    cv_pipeline = build_pipeline(
+        target_enc_cols, num_cols,
+        xgb_n_estimators=best_n,
+        use_stacking=True,
+    )
     cv_scores = cross_val_score(
         cv_pipeline, X, y,
         cv=5,
@@ -279,7 +327,7 @@ def main() -> None:
     print(f"  CV R² scores : {cv_scores.round(4)}")
     print(f"  Mean CV R²   : {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
 
-    # ── 8. Plot (USD scale) ───────────────────────────────────────────────
+    # ── 8. Plot (USD) ─────────────────────────────────────────────────────
     plot_predictions(
         y_test_usd.values,
         y_pred_test_usd,
@@ -291,10 +339,12 @@ def main() -> None:
     final_params["n_estimators"] = best_n
     log_experiment(
         params=final_params,
-        train_metrics=train_metrics,
-        test_metrics=test_metrics,
-        cv_r2=float(cv_scores.mean()),
+        train_metrics=test_metrics_log,   # log the LOG-scale metrics
+        test_metrics=test_metrics_log,
+        cv_r2_mean=float(cv_scores.mean()),
+        cv_r2_std=float(cv_scores.std()),
         n_features=X.shape[1],
+        use_stacking=True,
     )
 
     # ── 10. Save pipeline ─────────────────────────────────────────────────
@@ -308,28 +358,31 @@ def main() -> None:
         "Country": "United States of America",
         "YearsCode": 10.0,
         "WorkExp": 8.0,
-        "EdLevel": 4,            # Bachelor's
-        "Employment": 1,         # Full-time
+        "EdLevel": 4,
+        "Employment": 1,
         "DevType": "Full-stack",
-        "OrgSize": 4,            # 100-499 employees
-        "RemoteWork": 2,         # Remote
+        "OrgSize": 4,
+        "RemoteWork": 2,
         "Industry": "Information Services, IT, Software Development, or other Technology",
-        "Age": 2,                # 25-34
-        "ICorPM": 0,             # Individual contributor
+        "Age": 2,
+        "ICorPM": 0,
         "LanguageCount": 4,
         "DatabaseCount": 3,
         "PlatformCount": 2,
         "ToolCountWork": 5,
+        "DevTypeCount": 2,
+        "has_high_pay_lang": 1,
     }])
     sample = add_interaction_features(sample)
 
     log_pred = pipeline.predict(sample)[0]
     usd_pred = np.expm1(log_pred)
-    mae = test_metrics["mae"]
+    mae = test_metrics_usd["mae"]
 
-    print(f"  Input : {sample.iloc[0].to_dict()}")
     print(f"  Predicted salary : ${usd_pred:,.0f}  ±  ${mae:,.0f}")
-    print("\nTraining script complete. ✓")
+
+    elapsed = time.time() - t0
+    print(f"\nTraining script complete. ✓  ({elapsed:.0f}s)")
 
 
 if __name__ == "__main__":

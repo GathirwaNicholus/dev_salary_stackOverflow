@@ -1,14 +1,14 @@
 """
 Data cleaning utilities for developer salary prediction.
 
-v3 changes (from v2):
+v4 changes (from v3):
 ────────────────────
-1. EdLevel & RemoteWork converted to ordinal integers (preserves ordering)
-2. Country, DevType, Industry left as strings for target encoding in pipeline
-3. Employment filter: keep only Full-time & Freelance (removes noisy rows)
-4. Employment mapped to binary: Full-time=1, Freelance=0
-5. Interaction features: YearsCode², WorkExp², experience ratio, tech breadth
-6. Exported constants so the Streamlit app can reuse the same mappings
+1. NEW: has_high_pay_lang — binary flag for knowing Go/Rust/Scala/Kotlin/etc.
+2. NEW: DevTypeCount — number of roles listed (seniority proxy)
+3. EdLevel & RemoteWork as ordinal integers (preserves ordering)
+4. Country, DevType, Industry as strings for target encoding in pipeline
+5. Employment filter: keep only Full-time & Freelance
+6. Interaction features: YearsCode², WorkExp², experience ratio, tech breadth
 """
 from __future__ import annotations
 
@@ -266,6 +266,34 @@ def count_items(series: pd.Series) -> pd.Series:
     return series.apply(_count)
 
 
+# ── language & role features ──────────────────────────────────────────────
+
+# Languages that consistently pay above-average in SO salary surveys
+HIGH_PAY_LANGUAGES = {
+    "Go", "Rust", "Scala", "Elixir", "Clojure", "Kotlin",
+    "Swift", "F#", "Erlang", "Zig", "OCaml", "Haskell",
+}
+
+
+def has_high_pay_language(series: pd.Series) -> pd.Series:
+    """Return 1 if the respondent knows any high-paying language."""
+    def _check(val):
+        if pd.isna(val):
+            return 0
+        langs = {lang.strip() for lang in str(val).split(";")}
+        return 1 if langs & HIGH_PAY_LANGUAGES else 0
+    return series.apply(_check)
+
+
+def count_dev_types(series: pd.Series) -> pd.Series:
+    """Count how many developer roles a person lists (seniority proxy)."""
+    def _count(val):
+        if pd.isna(val):
+            return 0
+        return len(str(val).split(";"))
+    return series.apply(_count)
+
+
 def group_rare_countries(series: pd.Series, top_n: int = TOP_N_COUNTRIES) -> pd.Series:
     """Keep only the top-N most common countries; replace others with 'Other'."""
     top_countries = series.value_counts().head(top_n).index.tolist()
@@ -365,10 +393,13 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
     if "Industry" in df.columns:
         df["Industry"] = clean_industry(df["Industry"])
 
+    # Extract multi-value features BEFORE cleaning to single values
     if "DevType" in df.columns:
+        df["DevTypeCount"] = count_dev_types(df["DevType"])
         df["DevType"] = clean_dev_type(df["DevType"])
 
     if "LanguageHaveWorkedWith" in df.columns:
+        df["has_high_pay_lang"] = has_high_pay_language(df["LanguageHaveWorkedWith"])
         df["LanguageCount"] = count_items(df["LanguageHaveWorkedWith"])
         df = df.drop(columns=["LanguageHaveWorkedWith"])
 

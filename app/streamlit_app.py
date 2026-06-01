@@ -1,6 +1,6 @@
 """
 Simple Streamlit app for developer salary prediction.
-Run with:  streamlit run app/streamlit_app.py
+Run with:  python -m streamlit run app/streamlit_app.py
 """
 from __future__ import annotations
 
@@ -65,6 +65,20 @@ COUNTRY_OPTIONS = [
 @st.cache_resource
 def load_pipeline():
     """Load the trained pipeline once and cache it."""
+    # The saved model contains XGBoost objects — xgboost must be importable
+    try:
+        import xgboost  # noqa: F401
+    except ImportError:
+        st.error(
+            "**xgboost** is not installed in this Python environment.\n\n"
+            "Make sure you run Streamlit from the project's virtual environment:\n\n"
+            "```bash\n"
+            "source devSalaryVenv/bin/activate\n"
+            "python -m streamlit run app/streamlit_app.py\n"
+            "```"
+        )
+        st.stop()
+
     if not MODEL_PATH.exists():
         st.error(
             f"Model not found at `{MODEL_PATH}`.\n"
@@ -102,7 +116,7 @@ with col1:
     industry = st.selectbox("Industry", INDUSTRY_OPTIONS, index=0)
     ed_label = st.selectbox(
         "Education Level",
-        list(ED_LEVEL_ORDINAL.keys())[:-1],  # exclude "Other" default
+        [k for k in ED_LEVEL_ORDINAL if k != "Other"],
         index=4,  # default = Bachelor's
     )
     remote_label = st.selectbox(
@@ -131,6 +145,12 @@ with st.expander("Tech Skills (optional — uses defaults if skipped)"):
     db_count = st.slider("Databases Worked With", 0, 20, 2)
     platform_count = st.slider("Platforms / Cloud Providers", 0, 15, 2)
     tool_count = st.slider("Tools Used at Work", 0, 30, 5)
+    dev_type_count = st.slider(
+        "Number of Roles You Fill (e.g. Full-stack + DevOps = 2)", 1, 6, 1
+    )
+    has_high_pay = st.checkbox(
+        "I know Go, Rust, Scala, Kotlin, Swift, or Elixir", value=False
+    )
 
 # ── predict ────────────────────────────────────────────────────────────────
 
@@ -144,7 +164,7 @@ if st.button("🔮 Predict Salary", type="primary", use_container_width=True):
         "WorkExp": float(work_exp),
         "EdLevel": ED_LEVEL_ORDINAL[ed_label],
         "RemoteWork": REMOTE_ORDINAL[remote_label],
-        "Employment": 1,  # assume full-time (most common)
+        "Employment": 1,  # full-time
         "Age": AGE_ORDINAL[age_label],
         "OrgSize": ORGSIZE_ORDINAL[org_label],
         "ICorPM": 1 if is_manager == "Manager / Team Lead" else 0,
@@ -152,6 +172,8 @@ if st.button("🔮 Predict Salary", type="primary", use_container_width=True):
         "DatabaseCount": float(db_count),
         "PlatformCount": float(platform_count),
         "ToolCountWork": float(tool_count),
+        "DevTypeCount": dev_type_count,
+        "has_high_pay_lang": 1 if has_high_pay else 0,
     }])
 
     # Add the same interaction features used during training
@@ -175,4 +197,4 @@ if st.button("🔮 Predict Salary", type="primary", use_container_width=True):
 
 # ── footer ─────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("Built with Streamlit · Model: XGBoost on Stack Overflow 2025 Survey")
+st.caption("Built with Streamlit · Model: XGBoost + GBR Stacking on SO 2025 Survey")
