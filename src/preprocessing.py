@@ -1,14 +1,14 @@
 """
-Data cleaning utilities for developer salary csv.
-We will import this file in train.py and or app.py
+Data cleaning utilities for developer salary prediction.
 
-v2 – expanded feature set:
-  Added DevType, OrgSize, RemoteWork, WorkExp, Industry, Age,
-  ICorPM, DatabaseHaveWorkedWith (count), PlatformHaveWorkedWith
-  (count), ToolCountWork.
-  Applies log1p transform to the target so XGBoost models a
-  smoother distribution; inverse-transform is applied at
-  predict time.
+v3 changes (from v2):
+────────────────────
+1. EdLevel & RemoteWork converted to ordinal integers (preserves ordering)
+2. Country, DevType, Industry left as strings for target encoding in pipeline
+3. Employment filter: keep only Full-time & Freelance (removes noisy rows)
+4. Employment mapped to binary: Full-time=1, Freelance=0
+5. Interaction features: YearsCode², WorkExp², experience ratio, tech breadth
+6. Exported constants so the Streamlit app can reuse the same mappings
 """
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ import pandas as pd
 TARGET = "ConvertedCompYearly"
 LOG_TARGET = "log_salary"
 
-TOP_N_COUNTRIES = 25          # was 15 – more granularity
+TOP_N_COUNTRIES = 25
 SALARY_MIN = 10_000
 SALARY_MAX = 500_000
 
-# All columns we want to pull from the raw CSV
+# Columns pulled from the raw Stack Overflow survey CSV
 SELECTED_FEATURES = [
     "Country",
     "YearsCode",
@@ -41,6 +41,73 @@ SELECTED_FEATURES = [
     "PlatformHaveWorkedWith",
     "ToolCountWork",
 ]
+
+# These will be target-encoded inside the sklearn pipeline
+TARGET_ENC_FEATURES = ["Country", "DevType", "Industry"]
+
+# ── ordinal mappings (exported for Streamlit app) ─────────────────────────
+
+ED_LEVEL_ORDINAL: dict[str, int] = {
+    "Primary school": 0,
+    "High school": 1,
+    "Some college": 2,
+    "Associate's": 3,
+    "Bachelor's": 4,
+    "Master's": 5,
+    "Professional": 6,
+    "Other": 2,
+}
+
+REMOTE_ORDINAL: dict[str, int] = {
+    "In-person": 0,
+    "Hybrid": 1,
+    "Remote": 2,
+    "Other": 1,
+}
+
+AGE_ORDINAL: dict[str, int] = {
+    "Under 18": 0,
+    "18-24": 1,
+    "25-34": 2,
+    "35-44": 3,
+    "45-54": 4,
+    "55-64": 5,
+    "65+": 6,
+}
+
+ORGSIZE_ORDINAL: dict[str, int] = {
+    "Just me / freelancer": 0,
+    "2-9": 1,
+    "10-19": 2,
+    "20-99": 3,
+    "100-499": 4,
+    "500-999": 5,
+    "1,000-4,999": 6,
+    "5,000-9,999": 7,
+    "10,000+": 8,
+}
+
+DEV_TYPE_OPTIONS = [
+    "Full-stack", "Back-end", "Front-end", "Data/ML",
+    "DevOps/Cloud", "Mobile", "Embedded/Hardware",
+    "Security", "Management", "Other",
+]
+
+INDUSTRY_OPTIONS = [
+    "Information Services, IT, Software Development, or other Technology",
+    "Financial Services",
+    "Manufacturing, Transportation, or Supply Chain",
+    "Healthcare",
+    "Retail and Consumer Services",
+    "Insurance",
+    "Higher Education",
+    "Advertising Services",
+    "Government",
+    "Other",
+]
+
+# Employment categories we keep (rest are filtered out)
+EMPLOYMENT_KEEP = ["Full-time", "Freelance/Self-employed"]
 
 
 # ── individual column cleaners ─────────────────────────────────────────────
@@ -62,8 +129,8 @@ def clean_work_exp(series: pd.Series) -> pd.Series:
 
 
 def clean_education(series: pd.Series) -> pd.Series:
-    """Standardise verbose education labels into short categories."""
-    mapping = {
+    """Map verbose education strings → short label → ordinal integer."""
+    verbose_to_short = {
         "Master's degree (M.A., M.S., M.Eng., MBA, etc.)": "Master's",
         "Bachelor's degree (B.A., B.S., B.Eng., etc.)": "Bachelor's",
         "Some college/university study without earning a degree": "Some college",
@@ -73,7 +140,8 @@ def clean_education(series: pd.Series) -> pd.Series:
         "Primary/elementary school": "Primary school",
         "Other (please specify):": "Other",
     }
-    return series.map(mapping).fillna("Other")
+    short = series.map(verbose_to_short).fillna("Other")
+    return short.map(ED_LEVEL_ORDINAL)
 
 
 def clean_employment(series: pd.Series) -> pd.Series:
@@ -96,7 +164,7 @@ def clean_employment(series: pd.Series) -> pd.Series:
 
 
 def clean_age(series: pd.Series) -> pd.Series:
-    """Map verbose age bands to ordinal integers for the model."""
+    """Map verbose age bands to ordinal integers."""
     mapping = {
         "Under 18 years old": 0,
         "18-24 years old": 1,
@@ -139,40 +207,29 @@ def clean_icorpm(series: pd.Series) -> pd.Series:
 
 
 def clean_remote_work(series: pd.Series) -> pd.Series:
-    """Standardise remote-work values to short categories."""
-    mapping = {
+    """Map remote-work values to ordinal integers (0=in-person, 2=remote)."""
+    verbose_to_short = {
         "Remote": "Remote",
         "Hybrid (some remote, some in-person)": "Hybrid",
         "In-person": "In-person",
     }
-    return series.map(mapping).fillna("Other")
+    short = series.map(verbose_to_short).fillna("Other")
+    return short.map(REMOTE_ORDINAL)
 
 
 def clean_industry(series: pd.Series) -> pd.Series:
     """Keep top industries; merge the rest into 'Other'."""
-    top = [
-        "Information Services, IT, Software Development, or other Technology",
-        "Financial Services",
-        "Manufacturing, Transportation, or Supply Chain",
-        "Healthcare",
-        "Retail and Consumer Services",
-        "Insurance",
-        "Higher Education",
-        "Advertising Services",
-        "Government",
-    ]
+    top = INDUSTRY_OPTIONS[:-1]  # everything except the trailing "Other"
     return series.apply(lambda x: x if x in top else "Other").fillna("Other")
 
 
 def clean_dev_type(series: pd.Series) -> pd.Series:
     """Extract primary developer role from potentially multi-value field."""
-    # Keep only first role listed (before the semicolon)
     def _primary(val):
         if pd.isna(val):
             return "Other"
         roles = str(val).split(";")
         first = roles[0].strip()
-        # Group into broad buckets
         low = first.lower()
         if "full-stack" in low:
             return "Full-stack"
@@ -215,12 +272,43 @@ def group_rare_countries(series: pd.Series, top_n: int = TOP_N_COUNTRIES) -> pd.
     return series.apply(lambda x: x if x in top_countries else "Other")
 
 
+# ── interaction features ──────────────────────────────────────────────────
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add derived features that capture non-linear relationships.
+
+    Why these features help:
+    - YearsCode_sq   : diminishing returns on salary growth per year
+    - WorkExp_sq     : same for professional experience
+    - Exp_ratio      : what fraction of coding time was professional
+    - Tech_breadth   : total tools known = a proxy for seniority
+    """
+    df = df.copy()
+
+    if "YearsCode" in df.columns:
+        df["YearsCode_sq"] = df["YearsCode"] ** 2
+
+    if "WorkExp" in df.columns:
+        df["WorkExp_sq"] = df["WorkExp"] ** 2
+
+    if "YearsCode" in df.columns and "WorkExp" in df.columns:
+        df["Exp_ratio"] = df["WorkExp"] / (df["YearsCode"].fillna(0) + 1)
+
+    tech_cols = [c for c in ["LanguageCount", "DatabaseCount", "PlatformCount"]
+                 if c in df.columns]
+    if tech_cols:
+        df["Tech_breadth"] = df[tech_cols].fillna(0).sum(axis=1)
+
+    return df
+
+
 # ── main loader ────────────────────────────────────────────────────────────
 
 def load_and_clean(filepath: str) -> pd.DataFrame:
     """
     Load the Stack Overflow survey CSV and return a clean DataFrame
-    ready for the sklearn pipeline, with log1p-transformed salary.
+    ready for the sklearn pipeline with log1p-transformed salary.
 
     Parameters
     ----------
@@ -230,11 +318,11 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Features + LOG_TARGET column (log1p of ConvertedCompYearly).
+        Features + LOG_TARGET column.
     """
-    # step 0 — load
+    # step 0 — load raw data
     df = pd.read_csv(filepath, low_memory=False)
-    print(f"Raw shape: {df.shape} \n")
+    print(f"Raw shape: {df.shape}\n")
 
     # step 1 — salary filter
     df = df.dropna(subset=[TARGET])
@@ -247,7 +335,6 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
     missing = set(cols_needed) - set(cols_available)
     if missing:
         print(f"  Missing column(s) (will be skipped): {missing}")
-
     df = df[cols_available].copy()
 
     # step 3 — clean individual columns
@@ -258,7 +345,7 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
         df["WorkExp"] = clean_work_exp(df["WorkExp"])
 
     if "EdLevel" in df.columns:
-        df["EdLevel"] = clean_education(df["EdLevel"])
+        df["EdLevel"] = clean_education(df["EdLevel"])       # → ordinal int
 
     if "Employment" in df.columns:
         df["Employment"] = clean_employment(df["Employment"])
@@ -273,7 +360,7 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
         df["ICorPM"] = clean_icorpm(df["ICorPM"])
 
     if "RemoteWork" in df.columns:
-        df["RemoteWork"] = clean_remote_work(df["RemoteWork"])
+        df["RemoteWork"] = clean_remote_work(df["RemoteWork"])  # → ordinal int
 
     if "Industry" in df.columns:
         df["Industry"] = clean_industry(df["Industry"])
@@ -299,11 +386,22 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
     if "Country" in df.columns:
         df["Country"] = group_rare_countries(df["Country"])
 
-    # step 4 — log-transform salary (makes target distribution more normal)
+    # step 4 — filter employment (keep Full-time & Freelance only)
+    if "Employment" in df.columns:
+        before = len(df)
+        df = df[df["Employment"].isin(EMPLOYMENT_KEEP)]
+        df["Employment"] = (df["Employment"] == "Full-time").astype(int)
+        print(f"Employment filter: {before} → {len(df)} rows "
+              f"(kept Full-time & Freelance)")
+
+    # step 5 — add interaction / polynomial features
+    df = add_interaction_features(df)
+
+    # step 6 — log-transform salary
     df[LOG_TARGET] = np.log1p(df[TARGET])
     df = df.drop(columns=[TARGET])
 
-    # step 5 — drop rows where ALL features are NaN (edge case)
+    # step 7 — drop rows where ALL features are NaN
     df = df.dropna(how="all")
 
     print(f"Clean data shape: {df.shape}")
@@ -314,10 +412,14 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
 
 def get_feature_columns(df: pd.DataFrame) -> tuple[list, list]:
     """
-    Return (categorical_columns, numeric_columns) from the cleaned df,
-    excluding the log-salary target.
+    Return (target_enc_cols, numeric_cols) from the cleaned DataFrame.
+
+    target_enc_cols : string columns that will be target-encoded in the pipeline
+    numeric_cols    : all numeric columns (impute → scale)
     """
     non_target = [c for c in df.columns if c != LOG_TARGET]
-    cat_cols = df[non_target].select_dtypes(include=["object", "category"]).columns.tolist()
-    num_cols = df[non_target].select_dtypes(include=["number"]).columns.tolist()
-    return cat_cols, num_cols
+    target_enc = [c for c in TARGET_ENC_FEATURES if c in non_target]
+    num_cols = [c for c in non_target
+                if c not in target_enc
+                and pd.api.types.is_numeric_dtype(df[c])]
+    return target_enc, num_cols
