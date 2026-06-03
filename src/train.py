@@ -7,7 +7,7 @@
 """
 import os
 import sys
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, TargetEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -32,14 +32,16 @@ RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
 XGBOOST_PARAMS = {
-    'n_estimators': 300,
-    'max_depth': 5,
-    'learning_rate': 0.05,
+    'n_estimators': 600,
+    'max_depth': 6,
+    'learning_rate': 0.03,
     'random_state': RANDOM_STATE,
     'verbosity': 0,
     'subsample': 0.8,
     'colsample_bytree': 0.8,
-    'tree_method': 'hist' # makes execution fast for large datasets.
+    'tree_method': 'hist', # makes execution fast for large datasets.
+    'reg_alpha': 0.05, #L1
+    'reg_lambda': 1.0 #L2
 }
 
 def build_preprocessor(cat_cols: list, num_cols: list) -> ColumnTransformer:

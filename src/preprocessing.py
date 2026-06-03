@@ -7,11 +7,23 @@ import numpy as np
 
 # constants
 TARGET = 'ConvertedCompYearly'
-TOP_N_COUNTRIES = 15
+TOP_N_COUNTRIES = 25
 SALARY_MIN = 10_000
 SALARY_MAX = 500_000
 
-SELECTED_FEATURES = ['Country', 'YearsCode', 'EdLevel', 'Employment', 'LanguageHaveWorkedWith']
+SELECTED_FEATURES = ['Country', 'YearsCode', 'EdLevel', 'Employment', 'LanguageHaveWorkedWith',
+                     #new selected features, v2
+                     'DevType', # developer role 
+                     'OrgSize', # company size
+                     'RemoteWork', # remote/ hybrid/ in-person
+                     'WorkExp', # years of professional experience.
+                     'Industry', # eg tech, finance, healthcare etc
+                     'Age',
+                     'ICorPM', #Individual contributor or manager
+                     'DatabaseHaveWorkedWith',
+                     'PlatformHaveWorkedWith',
+                     'ToolCountWork'
+                     ]
 
 # Cleaning functions.
 def clean_years_code(series: pd.Series) -> pd.Series:
@@ -101,8 +113,11 @@ def load_and_clean(filepath: str) -> pd.DataFrame:
     df = df[df[TARGET].between(SALARY_MIN, SALARY_MAX)]
     print(f"Shape after the salary filter: {df.shape}")
 
+    # step 1.5 - v2 of model
+    df['log_salary'] = np.log1p(df[TARGET])
+
     # step 2 -  features + target and check whether they exist in the df
-    cols_needed = SELECTED_FEATURES + [TARGET]
+    cols_needed = SELECTED_FEATURES + ['log_salary']
     cols_available = [c for c in cols_needed if c in df.columns]
 
     missing_cols = set(cols_needed) - set(cols_available)
